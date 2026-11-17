@@ -637,6 +637,96 @@ async def f() -> None:
 );
 
 testcase!(
+    test_match_call_subject_class_pattern_nested_sequence_exhaustive,
+    r#"
+from dataclasses import dataclass
+
+@dataclass
+class Ok[T]:
+    value: T
+
+class NotFound:
+    pass
+
+def get() -> Ok[tuple[str, int]] | NotFound:
+    raise Exception()
+
+async def get_async() -> Ok[tuple[str, int]] | NotFound:
+    raise Exception()
+
+def f() -> int:
+    match get():
+        case NotFound():
+            return 0
+        case Ok((name, count)):
+            return len(name) + count
+
+async def g() -> int:
+    match await get_async():
+        case NotFound():
+            return 0
+        case Ok((name, count)):
+            pass
+    return len(name) + count
+"#,
+);
+
+testcase!(
+    test_match_call_subject_class_pattern_nested_class_exhaustive,
+    r#"
+from dataclasses import dataclass
+
+@dataclass
+class Ok[T]:
+    value: T
+
+class NotFound:
+    pass
+
+def get() -> Ok[int] | NotFound:
+    raise Exception()
+
+def f() -> int:
+    match get():
+        case NotFound():
+            return 0
+        case Ok(int()):
+            return 1
+
+def g() -> int:
+    match get():
+        case NotFound():
+            return 0
+        case Ok(value=int()):
+            return 1
+"#,
+);
+
+testcase!(
+    test_match_call_subject_class_pattern_partial_nested_not_exhaustive,
+    r#"
+from dataclasses import dataclass
+
+@dataclass
+class Ok[T]:
+    value: T
+
+class NotFound:
+    pass
+
+def get() -> Ok[int | str] | NotFound:
+    raise Exception()
+
+def f() -> int:  # E: missing an explicit `return`
+    match get():
+        case NotFound():
+            return 0
+        case Ok(int()):
+            return 1
+"#,
+);
+
+testcase!(
     test_match_sequence_pattern_narrows_tuple_out_of_union,
     r#"
 from typing import assert_never

@@ -68,7 +68,14 @@ enum MatchSubject {
     /// A local-only subject for matching non-name expressions (e.g., `match await f():`).
     /// Python evaluates the subject once before matching, so we need a stable internal
     /// subject for branch narrowing while diagnostics still point at the source expression.
-    Synthetic { display_subject_range: TextRange },
+    Synthetic {
+        display_subject_range: TextRange,
+        /// The binding of the evaluated subject.
+        subject_idx: Idx<Key>,
+        /// The facet of the evaluated subject that a sub-pattern matches (e.g., the
+        /// `value` attribute for `Ok((a, b))`), or `None` for the whole subject.
+        facet: Option<FacetSubject>,
+    },
     /// Per-element subjects from a fixed-arity tuple match (e.g., `match x, y:`).
     /// Each element retains the value binding from its evaluation to detect later writes.
     Tuple {
@@ -99,6 +106,37 @@ impl MatchSubject {
         )
     }
 
+    /// The subject a sub-pattern matches when it matches the facet `prop` of this subject.
+    fn with_facet(&self, prop: UnresolvedFacetKind) -> Self {
+        match (self, self.as_single()) {
+            (_, Some(subject)) => MatchSubject::Single(subject.with_facet(prop)),
+            (
+                MatchSubject::Synthetic {
+                    display_subject_range,
+                    subject_idx,
+                    facet,
+                },
+                None,
+            ) => MatchSubject::Synthetic {
+                display_subject_range: *display_subject_range,
+                subject_idx: *subject_idx,
+                facet: Some(FacetSubject::child(facet.as_ref(), prop)),
+            },
+            _ => MatchSubject::None,
+        }
+    }
+
+    /// Re-express `op`, a narrow of the value this subject matches, as a narrow of the
+    /// evaluated match subject.
+    fn local_subject_op(&self, op: NarrowOp) -> NarrowOp {
+        match self {
+            MatchSubject::Synthetic {
+                facet: Some(facet), ..
+            } => op.for_facet(facet),
+            _ => op,
+        }
+    }
+
     fn subject_narrow_op(&self, op: NarrowOp, range: TextRange) -> PatternNarrowOps {
         let mut narrow_ops = PatternNarrowOps::new();
         if let Some(subject) = self.as_single() {
@@ -107,7 +145,7 @@ impl MatchSubject {
                 .and_for_subject(subject, op.for_subject(subject), range);
         }
         if self.has_local_subject() {
-            narrow_ops.and_subject(Some((op, range)));
+            narrow_ops.and_subject(Some((self.local_subject_op(op), range)));
         }
         narrow_ops
     }
@@ -308,11 +346,15 @@ impl<'a> BindingsBuilder<'a> {
                 // first (so other union members don't pollute the slot), then require
                 // the type excluded by the subpattern to be `Never`. Irrefutable slots are
                 // already exhausted, so only refutable slots need solve-time probes.
-                let mut coverage_scope = match_subject
-                    .subject_narrow_op(NarrowOp::Atomic(None, class_narrow_op.clone()), cls_range)
-                    .scope;
-                coverage_scope.and_all(sub_ops.scope.negate());
-                let narrow_entries = self.build_narrow_entries(&coverage_scope);
+                let mut coverage_ops = match_subject
+                    .subject_narrow_op(NarrowOp::Atomic(None, class_narrow_op.clone()), cls_range);
+                coverage_ops.and_all(sub_ops.negate());
+                let narrow_entries = match (match_subject, coverage_ops.subject) {
+                    (MatchSubject::Synthetic { subject_idx, .. }, Some((op, range))) => {
+                        vec![(*subject_idx, Box::new(op), range)]
+                    }
+                    _ => self.build_narrow_entries(&coverage_ops.scope),
+                };
                 coverage_keys.push(self.insert_binding(
                     Key::Exhaustive(ExhaustivenessKind::ClassPatternCoverage, probe_range),
                     Binding::Exhaustive(Box::new(ExhaustiveBinding {
@@ -429,7 +471,10 @@ impl<'a> BindingsBuilder<'a> {
                             && let Some((alias_op, range)) =
                                 narrow_ops.scope.0.get(alias_name).cloned()
                         {
-                            narrow_ops.and_subject(Some((alias_op, range)));
+                            narrow_ops.and_subject(Some((
+                                original_subject.local_subject_op(alias_op),
+                                range,
+                            )));
                         }
                     }
                     narrow_ops
@@ -551,7 +596,8 @@ impl<'a> BindingsBuilder<'a> {
                             NarrowOp::Atomic(None, AtomicNarrowOp::Placeholder),
                         ])
                     };
-                    narrow_ops.and_subject(Some((subject_op, x.range)));
+                    narrow_ops
+                        .and_subject(Some((match_subject.local_subject_op(subject_op), x.range)));
                 }
                 // Without a star sub-pattern the sequence length is pinned exactly;
                 // with one it is only a lower bound.
@@ -805,7 +851,7 @@ impl<'a> BindingsBuilder<'a> {
                     || !x.arguments.keywords.is_empty())
                     && !all_args_irrefutable
                     && !is_exhaustive_single_slot
-                    && match_subject.as_single().is_some();
+                    && (match_subject.as_single().is_some() || match_subject.is_synthetic());
 
                 let mut narrow_ops = match_subject
                     .subject_narrow_op(NarrowOp::Atomic(None, narrow_op.clone()), x.cls.range());
@@ -850,16 +896,11 @@ impl<'a> BindingsBuilder<'a> {
                     );
                     // Narrow the matched attribute (`__match_args__[idx]`) as a facet
                     // of the subject, so sub-pattern narrowing flows to the parent.
-                    let subject_for_slot = if let Some(subject) = match_subject.as_single() {
-                        MatchSubject::Single(subject.clone().with_facet(
-                            UnresolvedFacetKind::MatchArg {
-                                class: x.cls.clone(),
-                                index: idx,
-                            },
-                        ))
-                    } else {
-                        MatchSubject::None
-                    };
+                    let subject_for_slot =
+                        match_subject.with_facet(UnresolvedFacetKind::MatchArg {
+                            class: x.cls.clone(),
+                            index: idx,
+                        });
                     let pattern_range = pattern.range();
                     let is_irrefutable = pattern.is_irrefutable();
                     let sub_ops = self.bind_pattern(subject_for_slot, pattern.clone(), attr_key);
@@ -882,15 +923,8 @@ impl<'a> BindingsBuilder<'a> {
                     pattern,
                 } in x.arguments.keywords
                 {
-                    let subject_for_attr = if let Some(subject) = match_subject.as_single() {
-                        MatchSubject::Single(
-                            subject
-                                .clone()
-                                .with_facet(UnresolvedFacetKind::Attribute(attr.id.clone())),
-                        )
-                    } else {
-                        MatchSubject::None
-                    };
+                    let subject_for_attr =
+                        match_subject.with_facet(UnresolvedFacetKind::Attribute(attr.id.clone()));
                     let pattern_range = pattern.range();
                     let is_irrefutable = pattern.is_irrefutable();
                     let attr_key = self.insert_binding(
@@ -1028,6 +1062,8 @@ impl<'a> BindingsBuilder<'a> {
                 Some(s) => MatchSubject::Single(s.clone()),
                 None => MatchSubject::Synthetic {
                     display_subject_range: x.subject.range(),
+                    subject_idx,
+                    facet: None,
                 },
             }
         };

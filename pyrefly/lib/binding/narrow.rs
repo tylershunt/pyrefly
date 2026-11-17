@@ -490,25 +490,31 @@ impl NarrowingSubject {
 
     pub fn with_facet(&self, prop: UnresolvedFacetKind) -> Self {
         match self {
-            Self::Name(name) => Self::Facets(
-                name.clone(),
-                FacetSubject {
-                    chain: UnresolvedFacetChain::new(Vec1::new(prop)),
-                    origin: FacetOrigin::Direct,
-                    allow_never_collapse: false,
-                },
-            ),
+            Self::Name(name) => Self::Facets(name.clone(), FacetSubject::child(None, prop)),
             Self::Facets(name, facets) => {
-                let props = Vec1::from_vec_push(facets.chain.facets().to_vec(), prop);
-                Self::Facets(
-                    name.clone(),
-                    FacetSubject {
-                        chain: UnresolvedFacetChain::new(props),
-                        origin: facets.origin,
-                        allow_never_collapse: facets.allow_never_collapse,
-                    },
-                )
+                Self::Facets(name.clone(), FacetSubject::child(Some(facets), prop))
             }
+        }
+    }
+}
+
+impl FacetSubject {
+    /// The facet `prop` of `base`, or of the root subject when `base` is `None`.
+    pub fn child(base: Option<&FacetSubject>, prop: UnresolvedFacetKind) -> Self {
+        match base {
+            None => FacetSubject {
+                chain: UnresolvedFacetChain::new(Vec1::new(prop)),
+                origin: FacetOrigin::Direct,
+                allow_never_collapse: false,
+            },
+            Some(base) => FacetSubject {
+                chain: UnresolvedFacetChain::new(Vec1::from_vec_push(
+                    base.chain.facets().to_vec(),
+                    prop,
+                )),
+                origin: base.origin,
+                allow_never_collapse: base.allow_never_collapse,
+            },
         }
     }
 }
@@ -652,6 +658,15 @@ impl NarrowOp {
     /// transformation merges facet chains: if the new subject has facets (e.g., `obj.attr`)
     /// and this operation has facets, they are concatenated.
     pub fn for_subject(&self, subject: &NarrowingSubject) -> Self {
+        match subject {
+            NarrowingSubject::Name(_) => self.clone(),
+            NarrowingSubject::Facets(_, base) => self.for_facet(base),
+        }
+    }
+
+    /// Transforms this narrowing operation on a value to apply to the facet `base` of that
+    /// value's parent, by prefixing `base` onto each operation's facet chain.
+    pub fn for_facet(&self, base: &FacetSubject) -> Self {
         fn merge_facet_subjects(base: &FacetSubject, extra: &FacetSubject) -> FacetSubject {
             let mut chain = base.chain.facets().clone();
             chain.extend(extra.chain.facets().clone());
@@ -671,26 +686,16 @@ impl NarrowOp {
             }
         }
 
-        fn for_facet_subject(
-            subject: &NarrowingSubject,
-            prop: Option<&FacetSubject>,
-        ) -> Option<FacetSubject> {
-            match (subject, prop) {
-                (NarrowingSubject::Name(_), None) => None,
-                (NarrowingSubject::Name(_), Some(facet)) => Some(facet.clone()),
-                (NarrowingSubject::Facets(_, base_facet), None) => Some(base_facet.clone()),
-                (NarrowingSubject::Facets(_, base_facet), Some(facet)) => {
-                    Some(merge_facet_subjects(base_facet, facet))
-                }
-            }
-        }
-
         match self {
-            Self::Atomic(prop, op) => {
-                Self::Atomic(for_facet_subject(subject, prop.as_ref()), op.clone())
-            }
-            Self::And(ops) => Self::And(ops.map(|op| op.for_subject(subject))),
-            Self::Or(ops) => Self::Or(ops.map(|op| op.for_subject(subject))),
+            Self::Atomic(prop, op) => Self::Atomic(
+                Some(match prop {
+                    None => base.clone(),
+                    Some(facet) => merge_facet_subjects(base, facet),
+                }),
+                op.clone(),
+            ),
+            Self::And(ops) => Self::And(ops.map(|op| op.for_facet(base))),
+            Self::Or(ops) => Self::Or(ops.map(|op| op.for_facet(base))),
         }
     }
 
